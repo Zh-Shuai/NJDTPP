@@ -1,5 +1,5 @@
 # Neural Jump-Diffusion Temporal Point Processes
-The implementation of our ICML-2024 paper ["Neural Jump-Diffusion Temporal Point Processes"]().
+The implementation of our ICML-2024 (Spotlight) paper ["Neural Jump-Diffusion Temporal Point Processes"](https://openreview.net/forum?id=d1P6GtRzuV).
 
 ## Dataset
 The real-world datasets are from ["EasyTPP"](https://github.com/ant-research/EasyTemporalPointProcess) and ["NHP"](https://github.com/hongyuanmei/neurawkes).
