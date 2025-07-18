@@ -1,6 +1,15 @@
 # Neural Jump-Diffusion Temporal Point Processes
 The implementation of our ICML-2024 (Spotlight) paper ["Neural Jump-Diffusion Temporal Point Processes"](https://openreview.net/forum?id=d1P6GtRzuV).
 
+## Updates
+**Updates** (July 18, 2025)
+
+**1. Improved Training Speed:** The training process now performs computations only on valid positions within padded sequences, eliminating unnecessary calculations for padding tokens. This optimization effectively reduces computational overhead, especially for datasets with large variations in sequence length.
+
+**2. Improved Inference Speed:** Inference has been optimized to handle batch predictions at once, rather than processing one sequence at a time, resulting in significantly faster inference times.
+
+**3. Upper Limit Estimation for Integral:** The upper limit ($\infty$) of the integral in Eq.(21) of our paper has been truncated using training data instead of test data. This change ensures a more reasonable approach.
+
 ## Dataset
 The real-world datasets are from ["EasyTPP"](https://github.com/ant-research/EasyTemporalPointProcess) and ["NHP"](https://github.com/hongyuanmei/neurawkes).
 
@@ -26,13 +35,13 @@ cd experiments
 
 This directory contains all experiments on three synthetic and six real-world datasets, for example:
 
-- Earthquake dataset
+- MIMIC-II dataset
 ```
-python earthquake.py
+python mimic2.py
 ```
 
 ## Citation
-If you find this code useful, please consider citing our paper. Thanks!
+If you find this code useful, please consider citing our paper:
 
 ```
 @inproceedings{zhang2024neural,

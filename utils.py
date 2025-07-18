@@ -23,68 +23,130 @@ def create_outpath(dataset):
     return outpath
 
 
-def forward_pass(sde, eta0, time_seqs, type_seqs, mask, device, batch_size, dim_eta, num_divide, args):
 
-    padded_seq_length = len(time_seqs[0])
-    sde.batch_size = batch_size
+def forward_pass(sde, eta0, time_seqs, type_seqs, mask, device, batch_size, dim_eta, num_divide, args):
+    
+    padded_seq_length = time_seqs.shape[1]
 
     eta_batch_l = torch.zeros(batch_size, padded_seq_length, dim_eta, device=device)
     # eta_batch_l[i,j,:] is the left-limit of \mathbf{eta} at the j-th event in the i-th sequence
     eta_batch_r = torch.zeros(batch_size, padded_seq_length, dim_eta, device=device)
-
     eta_time_l = torch.zeros(batch_size, padded_seq_length, device=device)
     # eta_time_l[i,j] == eta_batch_l[i,j,:][type_seqs[i,j]]
     eta_time_r = torch.zeros(batch_size, padded_seq_length, device=device)
 
-
-    eta_batch_l[:, 0, :] = eta0.unsqueeze(0).repeat(batch_size,1)
-    event_type = type_seqs[:, 0].tolist()
-    eta_time_l[:, 0] = eta_batch_l[list(range(0, batch_size)), 0, event_type]
-
-    eta_batch_r[:, 0, :] = eta_batch_l[:, 0, :] + sde.h(eta_batch_l[:, 0, :].clone())[list(range(0, batch_size)), :, event_type]
-    eta_time_r[:, 0] = eta_batch_r[list(range(0, batch_size)), 0, event_type]
+    eta_batch_l[:, 0, :] = eta0.unsqueeze(0).repeat(batch_size, 1)
     
-    tsave = torch.Tensor().to(device)
-    eta_tsave = torch.Tensor().to(device)
-    
+    # Use mask to only process valid first events
+    valid_first_mask = mask[:, 0].bool()  # [batch_size]
+    if valid_first_mask.any():
+        valid_indices = torch.where(valid_first_mask)[0]
+        num_valid = len(valid_indices)
+        event_type = type_seqs[valid_indices, 0].tolist()
+        
+        # Only compute for valid sequences
+        eta_batch_l_valid = eta_batch_l[valid_indices, 0, :]
+        sde.batch_size = num_valid
+        h_output = sde.h(eta_batch_l_valid.clone())  # [num_valid, dim_eta, dim_eta]
+        
+        batch_range = torch.arange(len(valid_indices), device=device)
+        # Extract eta_time_l for valid sequences
+        eta_time_l[valid_indices, 0] = eta_batch_l[valid_indices, 0, event_type]
+        # Update eta_batch_r for valid sequences
+        eta_batch_r[valid_indices, 0, :] = (
+            eta_batch_l[valid_indices, 0, :] + 
+            h_output[batch_range, :, event_type]
+        )
+        # Extract eta_time_r for valid sequences
+        eta_time_r[valid_indices, 0] = eta_batch_r[valid_indices, 0, event_type]
+
+
+    tsave = torch.empty(batch_size, 0, device=device)
+    eta_tsave = torch.empty(batch_size, dim_eta, 0, device=device)
     eta_initial = eta_batch_r[:, 0, :]
 
-    for i in range(padded_seq_length-1):
-        adjacent_events = time_seqs[:, i:i+2]
-        ts, eta_ts_l = EulerSolver(sde, eta_initial, adjacent_events, num_divide, device)
-        tsave = torch.cat((tsave, ts), dim=1)
-        eta_tsave = torch.cat((eta_tsave, eta_ts_l), dim=2)
+    # Find the maximum actual sequence length in this batch
+    max_seq_len = int(torch.max(torch.sum(mask, dim=1)).item())
 
-        eta_batch_l[:, i+1, :] = eta_ts_l[:, :, -1]
+    mask_bool = mask.bool()
+    interval_mask = mask_bool[:, :-1] & mask_bool[:, 1:]  # [batch_size, padded_seq_length-1]
 
-        eta_ts_r = eta_ts_l.clone()
-        event_type = type_seqs[:, i+1].tolist()
-        eta_ts_r[:, :, -1] = eta_ts_l[:, :, -1] + sde.h(eta_ts_l[:, :, -1])[list(range(0, batch_size)), :, event_type]
+    # Process each event position
+    for i in range(max_seq_len - 1):
 
-        eta_batch_r[:, i+1, :] = eta_ts_r[:, :, -1]
+        valid_indices = torch.where(interval_mask[:, i])[0]  # Indices of sequences with valid intervals at position i
+        num_valid = len(valid_indices)
+        
+        # Extract valid sequences for current interval
+        valid_adjacent_events = time_seqs[valid_indices, i:i+2]  # [num_valid, 2]
+        valid_eta_initial = eta_initial[valid_indices]  # [num_valid, dim_eta]
+        
+        # Solve SDE only for valid sequences
+        sde.batch_size = num_valid
+        ts_valid, eta_ts_l_valid = EulerSolver(sde, valid_eta_initial, valid_adjacent_events, num_divide, device)
+        # ts_valid: [num_valid, num_divide+1], eta_ts_l_valid: [num_valid, dim_eta, num_divide+1]
+        
+        # Pad ts and eta_ts to full batch size
+        ts_full = torch.zeros(batch_size, ts_valid.shape[1], device=device)
+        eta_ts_l_full = torch.zeros(batch_size, dim_eta, eta_ts_l_valid.shape[2], device=device)
+        
+        ts_full[valid_indices] = ts_valid
+        eta_ts_l_full[valid_indices] = eta_ts_l_valid
+        
+        # Concatenate to saved trajectories
+        tsave = torch.cat((tsave, ts_full), dim=1)
+        eta_tsave = torch.cat((eta_tsave, eta_ts_l_full), dim=2)
 
-        eta_time_l[:, i+1] = eta_batch_l[list(range(0, batch_size)), i+1, event_type]
-        eta_time_r[:, i+1] = eta_batch_r[list(range(0, batch_size)), i+1, event_type]
+        # Update eta_batch_l for valid sequences
+        eta_batch_l[valid_indices, i+1, :] = eta_ts_l_valid[:, :, -1]
 
-        eta_initial = eta_ts_r[:, :, -1]
+        # Compute jump for valid sequences
+        eta_ts_r_valid = eta_ts_l_valid.clone()
+        
+        h_output_valid = sde.h(eta_ts_l_valid[:, :, -1])  # [num_valid, dim_eta, dim_eta]
+        valid_batch_range = torch.arange(len(valid_indices), device=device)
+        valid_event_types = type_seqs[valid_indices, i+1].tolist()
+        
+        eta_ts_r_valid[:, :, -1] = (
+            eta_ts_l_valid[:, :, -1] + 
+            h_output_valid[valid_batch_range, :, valid_event_types]
+        )
+        eta_batch_r[valid_indices, i+1, :] = eta_ts_r_valid[:, :, -1]
 
+        eta_time_l[valid_indices, i+1] = eta_batch_l[valid_indices, i+1, valid_event_types]
+        eta_time_r[valid_indices, i+1] = eta_batch_r[valid_indices, i+1, valid_event_types]
+        
+        # Update eta_initial for next iteration
+        eta_initial[valid_indices] = eta_ts_r_valid[:, :, -1]
+
+    # Compute loss with proper masking
     masked_eta_time_l = eta_time_l * mask
     sum_term = torch.sum(masked_eta_time_l)
 
-    mask_without_first_col = mask[:, 1:]
-    expanded_mask = mask_without_first_col.unsqueeze(2).repeat(1, 1, num_divide+1).view(mask.size(0), -1)
-    expanded_mask = expanded_mask.unsqueeze(1).repeat(1,dim_eta,1)
-    
-    eta_tsave = eta_tsave * expanded_mask # mask the eta_tsave
+    # Redefine mask to only include columns 1 to max_seq_len-1
+    mask_redefined = mask[:, 1:max_seq_len]  # [batch_size, max_seq_len-1]
 
-    expanded_diff_tsave = torch.diff(tsave).unsqueeze(1).repeat(1, dim_eta, 1)
+    # Expand mask for eta_tsave dimension
+    expanded_mask = mask_redefined.unsqueeze(2).repeat(1, 1, num_divide+1).view(mask.size(0), -1)
+    expanded_mask = expanded_mask.unsqueeze(1).repeat(1, dim_eta, 1)
     
-    integral_term = torch.sum((torch.exp(eta_tsave)[:, :, :-1] * expanded_mask[:, :, :-1] + torch.exp(eta_tsave)[:, :, 1:] * expanded_mask[:, :, 1:]) * (expanded_diff_tsave * expanded_mask[:, :, 1:])) / 2  # reason for mask: e^0=1
+    # Apply mask to eta_tsave
+    eta_tsave_masked = eta_tsave * expanded_mask
+
+    expanded_diff_tsave = torch.diff(tsave, dim=1).unsqueeze(1).repeat(1, dim_eta, 1)
+    
+    # Trapezoidal integration with masking
+    integral_term = torch.sum(
+        (torch.exp(eta_tsave_masked)[:, :, :-1] * expanded_mask[:, :, :-1] + 
+         torch.exp(eta_tsave_masked)[:, :, 1:] * expanded_mask[:, :, 1:]) * 
+        (expanded_diff_tsave * expanded_mask[:, :, 1:])
+    ) / 2   # reason for mask: e^0=1
 
     log_likelihood = sum_term - integral_term
-    loss = - log_likelihood
+    loss = -log_likelihood
     
     return eta_batch_l, eta_batch_r, loss
+
 
 
 def EulerSolver(sde, eta_initial, adjacent_events, num_divide, device):
@@ -104,81 +166,111 @@ def EulerSolver(sde, eta_initial, adjacent_events, num_divide, device):
     return ts, eta_ts
 
 
-def next_predict(sde, eta0, time_seqs, type_seqs, device, dim_eta, num_divide, h=8, n_samples=1000, args=None):
+
+def next_predict(sde, eta0, time_seqs, type_seqs, mask, device, batch_size, dim_eta, num_divide, h, mean_max_train_dt, n_samples=1000, args=None):
     """
-    Predict the time and type of the next event given historical events.
+    Following THP and EasyTPP, we predict the next event time using historical events, and predict the next event type using historical events and the next event time.
     """
-
-    estimate_dt = []
-    next_dt = []
-    error_dt = []
-    estimate_type = []
-    next_type = []
-    loss_list = []
-
-    for idx, seq in enumerate(time_seqs):
+    
+    # time_seqs and type_seqs are already padded tensors with shape [num_sequences, padded_seq_length]
+    num_sequences, padded_seq_length = time_seqs.shape
+    
+    # all_estimate_dt = []
+    # all_next_dt = []
+    all_error_dt = []
+    all_estimate_type = []
+    all_next_type = []
+    all_losses = []
+    
+    # Process sequences in batches
+    for batch_start in range(0, num_sequences, batch_size):
+        batch_end = min(batch_start + batch_size, num_sequences)
+        current_batch_size = batch_end - batch_start
         
-        seq_time = seq.unsqueeze(0)
-        seq_type = type_seqs[idx].unsqueeze(0)
-        mask = torch.ones(1, len(seq), device=device)
-
-        eta_seq_l, eta_seq_r, loss_idx = forward_pass(sde, eta0, seq_time, seq_type, mask, device, batch_size=1, dim_eta=dim_eta, num_divide=num_divide, args=args)
+        batch_time_seqs = time_seqs[batch_start:batch_end]  # [current_batch_size, padded_seq_length]
+        batch_type_seqs = type_seqs[batch_start:batch_end]  # [current_batch_size, padded_seq_length]
+        batch_mask = mask[batch_start:batch_end]        # [current_batch_size, padded_seq_length]
         
-        dt_seq = torch.diff(seq)
-        max_dt = torch.max(dt_seq)
 
-        estimate_seq_dt = []
-        next_seq_dt = dt_seq.tolist()
-        error_seq_dt = []
-        estimate_seq_type = []
-        next_seq_type = type_seqs[idx][1:].tolist()
+        eta_batch_l, eta_batch_r, batch_loss = forward_pass(
+            sde, eta0, batch_time_seqs, batch_type_seqs, batch_mask, 
+            device, batch_size=current_batch_size, dim_eta=dim_eta, 
+            num_divide=num_divide, args=args
+        )
+        
+        all_losses.append(batch_loss)
+        
+        # Calculate time intervals for the batch
+        dt_batch = torch.diff(batch_time_seqs, dim=1)  # [current_batch_size, padded_seq_length-1]
+        
+        # Find the maximum actual sequence length in this batch
+        max_seq_len = int(torch.max(torch.sum(batch_mask, dim=1)).item())
 
-        for i in range(len(seq)-1):
-            last_t = seq[i]
-            n_dt = dt_seq[i]
-            timestep = h * max_dt / n_samples
-            tau = last_t + torch.linspace(0, h * max_dt, n_samples).to(device)
-            d_tau = tau - last_t
+        # Create mask for valid intervals (both current and next positions must be valid)
+        batch_mask_bool = batch_mask.bool()
+        interval_mask = batch_mask_bool[:, :-1] & batch_mask_bool[:, 1:]  # [current_batch_size, padded_seq_length-1]
+        
 
-            eta_last_t = eta_seq_r[:, i, :]
-
-            adjacent_events = torch.tensor([last_t, last_t+h * max_dt], device=device).unsqueeze(0)
-
-            _, eta_tau = EulerSolver(sde, eta_last_t, adjacent_events, n_samples-1, device)
-
-            eta_tau = eta_tau.squeeze(0)
-
-            intens_tau = torch.exp(eta_tau)
-            intens_tau_sum = intens_tau.sum(dim=0)
-            integral = torch.cumsum(timestep * intens_tau_sum, dim=0)
-            # density for the time-until-next-event law
-            density = intens_tau_sum * torch.exp(-integral) 
+        for i in range(max_seq_len - 1):
+            # Get the mask for current position across all sequences in batch
+            pos_mask = interval_mask[:, i]  # [current_batch_size]
+            valid_seqs = torch.where(pos_mask)[0]  # Indices of sequences with valid intervals at position i
+                
+            # Extract data for valid sequences at position i
+            last_t_batch = batch_time_seqs[valid_seqs, i]  # [num_valid_seqs]
+            n_dt_batch = dt_batch[valid_seqs, i]           # [num_valid_seqs]
+            eta_last_t_batch = eta_batch_r[valid_seqs, i, :]  # [num_valid_seqs, dim_eta]
             
-            d_tau_f_tau = d_tau * density
+
+            timestep = h * mean_max_train_dt / n_samples
+            tau_batch = last_t_batch.unsqueeze(1) + torch.linspace(0, h * mean_max_train_dt, n_samples).to(device).unsqueeze(0)  # [num_valid_seqs, n_samples]
+            d_tau_batch = tau_batch - last_t_batch.unsqueeze(1) 
+            
+
+            adjacent_events_batch = torch.stack([
+                last_t_batch, 
+                last_t_batch + h * mean_max_train_dt
+            ], dim=1)  # [num_valid_seqs, 2]
+            
+
+            # EulerSolver can handle batch dimension
+            sde.batch_size = len(valid_seqs)
+            _, eta_tau_batch = EulerSolver(sde, eta_last_t_batch, adjacent_events_batch, n_samples-1, device)
+            # eta_tau_batch: [num_valid_seqs, dim_eta, n_samples]
+            
+            intens_tau_batch = torch.exp(eta_tau_batch)  # [num_valid_seqs, dim_eta, n_samples]
+            intens_tau_sum_batch = intens_tau_batch.sum(dim=1)  # [num_valid_seqs, n_samples]
+            
+            integral_batch = torch.cumsum(timestep * intens_tau_sum_batch, dim=1)  # [num_valid_seqs, n_samples]
+            density_batch = intens_tau_sum_batch * torch.exp(-integral_batch)  # [num_valid_seqs, n_samples]
+            
+
+            d_tau_f_tau_batch = d_tau_batch * density_batch  # [num_valid_seqs, n_samples]
             # trapezoidal method
-            e_dt = (timestep * 0.5 * (d_tau_f_tau[1:] + d_tau_f_tau[:-1])).sum()
-            err_dt = torch.abs(e_dt - n_dt)
-            e_type = torch.argmax(eta_seq_l[0][i+1])
+            e_dt_batch = (timestep * 0.5 * (d_tau_f_tau_batch[:, 1:] + d_tau_f_tau_batch[:, :-1])).sum(dim=1)  # [num_valid_seqs]
+            err_dt_batch = torch.abs(e_dt_batch - n_dt_batch)
+            
 
-            estimate_seq_dt.append(e_dt.item())
-            error_seq_dt.append(err_dt.item())
-            estimate_seq_type.append(e_type.item())
+            e_type_batch = torch.argmax(eta_batch_l[valid_seqs, i+1], dim=1)  # [num_valid_seqs]
+            
+            # Store results
+            # all_estimate_dt.extend(e_dt_batch.tolist())
+            # all_next_dt.extend(n_dt_batch.tolist())
+            all_error_dt.extend(err_dt_batch.tolist())
+            all_estimate_type.extend(e_type_batch.tolist())
+            all_next_type.extend(batch_type_seqs[valid_seqs, i+1].tolist())
+    
+    # Calculate metrics
+    error_dt_tensor = torch.tensor(all_error_dt)
+    RMSE = np.linalg.norm(error_dt_tensor.detach().cpu().numpy(), ord=2) / (len(error_dt_tensor) ** 0.5)
+    
+    acc = accuracy_score(all_next_type, all_estimate_type)
+    f1 = f1_score(all_next_type, all_estimate_type, average='weighted')
 
-        loss_list.append(loss_idx)
-        estimate_dt.extend(estimate_seq_dt)
-        next_dt.extend(next_seq_dt)
-        error_dt.extend(error_seq_dt)
-        
-        estimate_type.extend(estimate_seq_type)
-        next_type.extend(next_seq_type)
-        
-    error_dt_tensor = torch.tensor(error_dt)
-    RMSE = np.linalg.norm(error_dt_tensor.detach().numpy(), ord=2) / (len(error_dt_tensor) ** 0.5)
-    acc = accuracy_score(next_type, estimate_type)
-    f1 = f1_score(next_type, estimate_type, average='weighted') 
-    loss = sum(loss_list)
+    total_loss = sum(all_losses)
+    
+    return total_loss, RMSE, acc, f1
 
-    return loss, RMSE, acc, f1
 
 
 def self_correcting_intensity(t, seq, mu, alpha):

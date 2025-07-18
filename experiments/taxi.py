@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from modules import RunningAverageMeter, NJDSDE
-from utils import create_outpath, process_loaded_sequences, build_input_from_pkl, forward_pass, next_predict
+from utils import create_outpath, process_loaded_sequences, forward_pass, next_predict
 
 
 signal.signal(signal.SIGINT, lambda sig, frame: sys.exit(0))
@@ -42,11 +42,24 @@ if __name__ == '__main__':
 
     train_time, train_type, train_num_types, train_seq_lengths, train_mask = \
         process_loaded_sequences(device=device, source_dir='../data/taxi/train.pkl', split='train')
-    dev_time, dev_type, dev_num_types, dev_seq_lengths = \
-        build_input_from_pkl(device=device, source_dir='../data/taxi/dev.pkl', split='dev')
-    test_time, test_type, test_num_types, test_seqs_lengths = \
-        build_input_from_pkl(device=device, source_dir='../data/taxi/test.pkl', split='test')
-    num_test_event = sum([len(seq) for seq in test_time])
+    dev_time, dev_type, dev_num_types, dev_seq_lengths, dev_mask = \
+        process_loaded_sequences(device=device, source_dir='../data/taxi/dev.pkl', split='dev')
+    test_time, test_type, test_num_types, test_seqs_lengths, test_mask = \
+        process_loaded_sequences(device=device, source_dir='../data/taxi/test.pkl', split='test')
+    num_test_event = torch.sum(test_mask).item()
+
+
+    # The mean of the maximum inter-event time across all training sequences is used for the Integral Upper Limit Estimation in Eq.(21).
+    intervals = torch.diff(train_time, dim=1)
+    
+    bool_mask = train_mask.bool()
+    interval_mask = bool_mask[:, :-1] & bool_mask[:, 1:]
+    
+    masked_intervals = torch.where(interval_mask, intervals, torch.tensor(float('-inf'), device=device))
+    row_max_intervals = torch.max(masked_intervals, dim=1)[0]
+    valid_row_max = row_max_intervals[row_max_intervals != float('-inf')]
+    mean_max_train_dt = torch.mean(valid_row_max).item()
+
 
     # initialize / load model
     dim_eta = train_num_types
@@ -92,6 +105,7 @@ if __name__ == '__main__':
 
         it = it+1
 
+
         # validate
         if it % args.nsave == 0:
             # save
@@ -99,5 +113,5 @@ if __name__ == '__main__':
 
 
     # test
-    test_loss, RMSE, acc, f1 = next_predict(sde, eta0, test_time, test_type, device, dim_eta=dim_eta, num_divide=args.num_divide, h=8, n_samples=1000, args=args)
+    test_loss, RMSE, acc, f1 = next_predict(sde, eta0, test_time, test_type, test_mask, device, batch_size=args.batch_size, dim_eta=dim_eta, num_divide=args.num_divide, h=8, mean_max_train_dt=mean_max_train_dt, n_samples=1000, args=args)
     print("iter: {:5d}, nll: {:10.4f}, RMSE: {:10.4f}, acc: {:10.4f}, f1: {:10.4f}".format(it, test_loss/num_test_event, RMSE, acc, f1), flush=True)
